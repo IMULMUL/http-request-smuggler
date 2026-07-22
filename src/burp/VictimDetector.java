@@ -19,6 +19,15 @@ import java.util.Set;
  */
 public class VictimDetector {
 
+    /**
+     * Builds a fully-formed, position-aware attack request. The CL desync MUST be
+     * applied last (after the body/canary is set) so it is not recomputed away.
+     */
+    @FunctionalInterface
+    public interface AttackBuilder {
+        HttpRequest build(ProbePayloads.Payload payload, int batch, int position);
+    }
+
     public static final int BUCKETED_5XX_ORIGIN = 599;
 
     private final long phaseDelayMs;
@@ -97,16 +106,7 @@ public class VictimDetector {
 
     // ---- Phase 1: canary victim check -------------------------------------
 
-    /** Build the position-specific attack request by swapping the canary token in the body. */
-    private HttpRequest attackForPosition(HttpRequest baseAttack, int techniqueId, int batch, int position) {
-        if (position == 0) return baseAttack;
-        String base = CanaryUtils.generateCanary(techniqueId, batch, 0);
-        String want = CanaryUtils.generateCanary(techniqueId, batch, position);
-        String body = baseAttack.bodyToString();
-        return baseAttack.withBody(body.replace(base, want));
-    }
-
-    public VictimCheckResult runVictimCheckWithCanary(HttpRequest attack, HttpRequest victim,
+    public VictimCheckResult runVictimCheckWithCanary(AttackBuilder attackBuilder, HttpRequest victim,
             ProbePayloads.Payload payload, int techniqueId, int batch) {
         Set<Integer> victimStatusCodes = new HashSet<>();
         List<MontoyaRequestResponse> victimResponses = new ArrayList<>();
@@ -114,8 +114,8 @@ public class VictimDetector {
         List<ReflectionResult> reflections = new ArrayList<>();
         Map<String, MontoyaRequestResponse> canaryToAttack = new HashMap<>();
 
-        HttpRequest a1 = attackForPosition(attack, techniqueId, batch, 0);
-        HttpRequest a2 = attackForPosition(attack, techniqueId, batch, 2);
+        HttpRequest a1 = attackBuilder.build(payload, batch, 0);
+        HttpRequest a2 = attackBuilder.build(payload, batch, 2);
         String c1 = CanaryUtils.generateCanary(techniqueId, batch, 0);
         String c2 = CanaryUtils.generateCanary(techniqueId, batch, 2);
 
@@ -130,8 +130,8 @@ public class VictimDetector {
         collectVictimResponse(b1.get(3), victimStatusCodes, victimResponses);
         checkForReflection(b1.get(3), techniqueId, batch, 3, canaryToAttack, reflections, true);
 
-        HttpRequest a3 = attackForPosition(attack, techniqueId, batch, 4);
-        HttpRequest a4 = attackForPosition(attack, techniqueId, batch, 6);
+        HttpRequest a3 = attackBuilder.build(payload, batch, 4);
+        HttpRequest a4 = attackBuilder.build(payload, batch, 6);
         String c3 = CanaryUtils.generateCanary(techniqueId, batch, 4);
         String c4 = CanaryUtils.generateCanary(techniqueId, batch, 6);
 
@@ -296,7 +296,7 @@ public class VictimDetector {
      * carried on the result so the caller can report them.
      */
     public FollowupResult runFollowupScans(
-            java.util.function.BiFunction<ProbePayloads.Payload, Integer, HttpRequest> attackBuilder,
+            AttackBuilder attackBuilder,
             HttpRequest victim, Set<Integer> initialVictimCodes, int techniqueId,
             Integer consistentBaselineCode) throws InterruptedException {
         int batch = 2;
@@ -305,8 +305,7 @@ public class VictimDetector {
         List<ReflectionResult> allReflections = new ArrayList<>();
         for (ProbePayloads.Payload payload : ProbePayloads.getAllPayloads()) {
             Thread.sleep(followupDelayMs);
-            HttpRequest attack = attackBuilder.apply(payload, batch);
-            VictimCheckResult result = runVictimCheckWithCanary(attack, victim, payload, techniqueId, batch);
+            VictimCheckResult result = runVictimCheckWithCanary(attackBuilder, victim, payload, techniqueId, batch);
             batch++;
             allReflections.addAll(result.getReflections());
             for (MontoyaRequestResponse ar : result.getAttackResponses()) {
@@ -354,10 +353,9 @@ public class VictimDetector {
      * gate. Reflections from Phases 1/3/4 are collected onto the result regardless
      * of the status-code outcome; the caller reports them independently.
      */
-    public DetectionResult validate(HttpRequest attack,
-            java.util.function.BiFunction<ProbePayloads.Payload, Integer, HttpRequest> attackBuilder,
-            HttpRequest victim, ProbePayloads.Payload payload, int techniqueId,
-            String hostname, String vectorLabel, Set<String> erraticHosts) {
+    public DetectionResult validate(AttackBuilder attackBuilder, HttpRequest victim,
+            ProbePayloads.Payload payload, int techniqueId, String hostname,
+            String vectorLabel, Set<String> erraticHosts) {
 
         // Known-erratic host: skip (no Phase 1 run, so nothing to report).
         if (erraticHosts.contains(hostname)) {
@@ -367,7 +365,7 @@ public class VictimDetector {
         DetectionResult result = new DetectionResult();
 
         // Phase 1: victim check with canary injection (batch 1).
-        VictimCheckResult victimResult = runVictimCheckWithCanary(attack, victim, payload, techniqueId, 1);
+        VictimCheckResult victimResult = runVictimCheckWithCanary(attackBuilder, victim, payload, techniqueId, 1);
         result.reflections.addAll(victimResult.getReflections());
         if (!victimResult.foundInconsistency()) {
             return result; // no desync signal; reflections still delivered
@@ -444,8 +442,8 @@ public class VictimDetector {
                     Thread.currentThread().interrupt();
                     return result;
                 }
-                // Batch 4 (Phase 1 was batch 1, Phase 3 batches 2-3).
-                VictimCheckResult retryResult = runVictimCheckWithCanary(attack, victim, payload, techniqueId, 4);
+                // Batch 4 (Phase 1 was batch 1; Phase 3 iterated all payloads, batches 2..14).
+                VictimCheckResult retryResult = runVictimCheckWithCanary(attackBuilder, victim, payload, techniqueId, 4);
                 result.reflections.addAll(retryResult.getReflections());
                 if (retryResult.foundInconsistency()) {
                     inconsistencyReproduced = true;
@@ -502,8 +500,8 @@ public class VictimDetector {
                 correlation = CorrelationCheck.defaults(correlationGapMs).run(
                     baselineCode,
                     cycle -> runVictimCheckWithCanary(
-                        attackBuilder.apply(correlationPayload, 100 + cycle),
-                        victim, correlationPayload, techniqueId, 100 + cycle).getVictimStatusCodes(),
+                        attackBuilder, victim, correlationPayload, techniqueId, 100 + cycle)
+                        .getVictimStatusCodes(),
                     cycle -> runControlBurst(victim));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

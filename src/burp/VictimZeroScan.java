@@ -7,7 +7,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Set;
-import java.util.function.BiFunction;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * CL.0 victim scan: same vectors as ImplicitZeroScan, but detects desync via
@@ -15,9 +16,9 @@ import java.util.function.BiFunction;
  */
 public class VictimZeroScan extends SmuggleScanBox {
 
-    private final Set<String> erraticHosts = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    private final java.util.concurrent.ConcurrentHashMap<String, Integer> techniqueIds = new java.util.concurrent.ConcurrentHashMap<>();
-    private final java.util.concurrent.atomic.AtomicInteger nextTechniqueId = new java.util.concurrent.atomic.AtomicInteger(0);
+    private final Set<String> erraticHosts = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<String, Integer> techniqueIds = new ConcurrentHashMap<>();
+    private final AtomicInteger nextTechniqueId = new AtomicInteger(0);
 
     VictimZeroScan(String name) {
         super(name);
@@ -70,17 +71,17 @@ public class VictimZeroScan extends SmuggleScanBox {
         final byte[] reqBase = req;                 // effectively-final for the lambda
         final boolean fHttp2 = forceHTTP2;
 
-        // Build a fully-formed desync'd attack for a (payload, batch): inject canary at position 0.
-        BiFunction<ProbePayloads.Payload, Integer, HttpRequest> attackBuilder = (payload, batch) -> {
-            String body = CanaryUtils.injectCanaryIntoPayload(payload.getBody(), techniqueId, batch, 0);
-            byte[] attack = Utilities.fixContentLength(Utilities.setBody(reqBase, body));
-            attack = DesyncBox.applyDesync(attack, "Content-Length", technique);
-            HttpRequest hr = Utilities.buildMontoyaReq(attack, service);
+        // Build a fully-formed desync'd attack per (payload, batch, position): inject the canary
+        // at the given byte position, then apply the CL desync LAST so it is not recomputed away.
+        VictimDetector.AttackBuilder attackBuilder = (p, batch, position) -> {
+            String body = CanaryUtils.injectCanaryIntoPayload(p.getBody(), techniqueId, batch, position);
+            byte[] attackBytes = Utilities.fixContentLength(Utilities.setBody(reqBase, body));
+            attackBytes = DesyncBox.applyDesync(attackBytes, "Content-Length", technique);
+            HttpRequest hr = Utilities.buildMontoyaReq(attackBytes, service);
             return fHttp2 ? hr.withAddedHeader("X-Http2", "1") : hr;
         };
 
         ProbePayloads.Payload payload = ProbePayloads.getDefaultPayload();
-        HttpRequest attack = attackBuilder.apply(payload, 1);
 
         // Victim = clean cache-busted baseline (no smuggle, no desync).
         byte[] victimBytes = Utilities.addCacheBuster(baseReq, null);
@@ -97,7 +98,7 @@ public class VictimZeroScan extends SmuggleScanBox {
         VictimDetector.DetectionResult result;
         try {
             result = detector.validate(
-                attack, attackBuilder, victim, payload, techniqueId,
+                attackBuilder, victim, payload, techniqueId,
                 service.getHost(), technique, erraticHosts);
         } catch (Exception e) {
             Utilities.out("VictimZeroScan: unexpected error validating " + service.getHost() + " (" + technique + "): " + e);
