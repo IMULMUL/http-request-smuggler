@@ -499,9 +499,12 @@ public class VictimDetector {
             try {
                 correlation = CorrelationCheck.defaults(correlationGapMs).run(
                     baselineCode,
-                    cycle -> runVictimCheckWithCanary(
-                        attackBuilder, victim, correlationPayload, techniqueId, 100 + cycle)
-                        .getVictimStatusCodes(),
+                    cycle -> {
+                        VictimCheckResult cr = runVictimCheckWithCanary(
+                            attackBuilder, victim, correlationPayload, techniqueId, 100 + cycle);
+                        result.reflections.addAll(cr.getReflections());
+                        return cr.getVictimStatusCodes();
+                    },
                     cycle -> runControlBurst(victim));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

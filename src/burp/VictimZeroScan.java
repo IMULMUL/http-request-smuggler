@@ -127,9 +127,14 @@ public class VictimZeroScan extends SmuggleScanBox {
         // MontoyaRequestResponse implements HttpRequestResponse directly.
         burp.api.montoya.http.message.HttpRequestResponse[] arr =
             evidence.toArray(new burp.api.montoya.http.message.HttpRequestResponse[0]);
-        Report report = new Report(title, detail,
-            "Detected via victim-request inconsistency / canary reflection. See https://portswigger.net/research/browser-powered-desync-attacks",
-            "", severity, arr);
+        String background = "The site appears vulnerable to HTTP request smuggling / desync: a crafted request can "
+            + "interfere with other requests processed on the same upstream connection. Detected here via "
+            + "victim-request status inconsistency and/or canary reflection.";
+        String remediation = "Ensure the front-end and back-end agree on request boundaries (consistent "
+            + "Content-Length / Transfer-Encoding handling). See "
+            + "https://portswigger.net/research/browser-powered-desync-attacks and "
+            + "https://portswigger.net/web-security/request-smuggling.";
+        Report report = new Report(title, detail, background, remediation, severity, arr);
         Utilities.montoyaApi.siteMap().add(report.getIssue());
     }
 }
