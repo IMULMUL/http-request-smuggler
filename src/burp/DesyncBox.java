@@ -116,6 +116,11 @@ public class DesyncBox {
         clPermutations.register("CL-expect-obfs", true);
         clPermutations.register("CL-error", true);
         clPermutations.register("CL-spacepad", true);
+        clPermutations.register("CL-byteranges", true);
+        clPermutations.register("CL-multiform", true);
+        clPermutations.register("CL-deleteMaxforward", true);
+        clPermutations.register("CL-gzip10", true);
+        clPermutations.register("CL-dualCL", true);
 
         supportedPermutations = new HashSet<>();
         supportedPermutations.addAll(sharedPermutations.getSettings());
@@ -309,6 +314,21 @@ public class DesyncBox {
             case "range":
                 transformed = Utilities.addOrReplaceHeader(request, "Range", "bytes=0-0");
                 break;
+            case "CL-byteranges":
+                transformed = Utilities.addOrReplaceHeader(request, "Content-Type", "multipart/byteranges; boundary=" + Utilities.generateCanary());
+                break;
+            case "CL-multiform":
+                transformed = Utilities.addOrReplaceHeader(request, "Content-Type", "multipart/form-data; boundary=" + Utilities.generateCanary());
+                break;
+            case "CL-deleteMaxforward":
+                transformed = Utilities.setMethod(request, "DELETE");
+                transformed = Utilities.addOrReplaceHeader(transformed, "Max-Forwards", "0");
+                break;
+            case "CL-gzip10":
+                transformed = Utilities.replaceFirst(request, "HTTP/1.1", "HTTP/1.0");
+                transformed = Utilities.replaceFirst(transformed, "HTTP/2", "HTTP/1.0");
+                transformed = Utilities.addOrReplaceHeader(transformed, "Transfer-Encoding", "gzip");
+                break;
             case "h2CL":
                 transformed = Utilities.addOrReplaceHeader(request, "Content-Length", "0");
                 // we have to bypass the no-effect check
@@ -392,6 +412,9 @@ public class DesyncBox {
 
         if(header.equals(("Content-Length: "))) {
             switch (technique) {
+                case "CL-dualCL":
+                    transformed = Utilities.replace(request, "Content-Length: " + value, "Content-Length: " + value + "\r\nContent-Length: " + value);
+                    break;
                 case "CL-plus":
                     transformed = Utilities.replace(request, "Content-Length: ", "Content-Length: +");
                     break;
