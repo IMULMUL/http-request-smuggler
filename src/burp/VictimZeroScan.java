@@ -113,7 +113,11 @@ public class VictimZeroScan extends SmuggleScanBox {
 
         if (!result.success) return false;
         fileIssue(result.title, result.detail, result.severity, result.evidence);
-        return true;
+        // Informational findings are filed but must NOT mark the vector/host as "done":
+        // returning true feeds BulkScan.hostsToSkip and, with "skip obsolete permutations"
+        // enabled, breaks the permutation loop (SmuggleScanBox), which would let a weak
+        // note short-circuit a later vector that could confirm a real desync.
+        return result.severity != AuditIssueSeverity.INFORMATION;
     }
 
     private void reportReflection(ReflectionResult refl) {

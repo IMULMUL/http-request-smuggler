@@ -376,7 +376,23 @@ public class VictimDetector {
         // Phase 2: erratic-domain detection (leading settle sleep is inside).
         ErraticDomainResult erraticResult = detectErraticDomain(victim, differingStatusCode);
         if (erraticResult.isErratic()) {
-            erraticHosts.add(hostname);
+            // Set.add() is atomic: only the first thread to flag this host gets true,
+            // so the informational note is filed exactly once per host.
+            if (erraticHosts.add(hostname)) {
+                List<MontoyaRequestResponse> erraticEvidence = new ArrayList<>();
+                if (!victimResult.getAttackResponses().isEmpty() && victimResult.getAttackResponses().get(0) != null) {
+                    erraticEvidence.add(victimResult.getAttackResponses().get(0));
+                }
+                addTwoDistinctResponses(victimResult.getVictimResponses(), victimResult.getVictimStatusCodes(), erraticEvidence);
+                result.success = true;
+                result.severity = AuditIssueSeverity.INFORMATION;
+                result.title = "Victim Desync: Erratic Host — " + vectorLabel;
+                result.detail = "When the victim request was sent alongside the attack, it received inconsistent status codes: "
+                    + victimResult.getRawVictimStatusCodes() + "\n\n"
+                    + "However, the same inconsistency also appeared in attack-free control bursts, so this host is too "
+                    + "erratic to test reliably. The vector could not be evaluated; recorded for visibility.";
+                result.evidence.addAll(erraticEvidence);
+            }
             return result;
         }
 
@@ -452,7 +468,17 @@ public class VictimDetector {
             }
 
             if (!inconsistencyReproduced) {
-                return result; // likely a server blip; reflections still delivered
+                // Phase-1 signal seen but not reproduced: most likely a transient blip.
+                // Surface it as informational rather than discarding entirely.
+                result.success = true;
+                result.severity = AuditIssueSeverity.INFORMATION;
+                result.title = "Victim Desync: Unreplicated — " + vectorLabel;
+                result.detail = "When the victim request was sent alongside the attack, it received inconsistent status codes: " + victimCodesStr + "\n\n"
+                    + "When sent without the attack, it received a consistent status code of " + consistentCodeStr + "\n\n"
+                    + "The inconsistency did not reproduce across " + phase4Retries + " retries, so it was not confirmed as a "
+                    + "desync (most likely a transient server blip). Recorded for visibility.";
+                result.evidence.addAll(evidence);
+                return result;
             }
 
             // Suppress weaker (non-Confirmed) findings when Phase 1 saw a bucketed
