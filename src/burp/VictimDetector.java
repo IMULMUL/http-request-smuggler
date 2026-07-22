@@ -3,6 +3,7 @@ package burp;
 import burp.api.montoya.http.HttpMode;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -200,6 +201,360 @@ public class VictimDetector {
                 if (!isBoringStatusCode(c)) raw.add(c);
             }
             return raw;
+        }
+    }
+
+    // ---- Phase 2: erratic-domain detection + control burst ----------------
+
+    public static class ErraticDomainResult {
+        private final boolean erratic; private final Integer consistentStatusCode;
+        public ErraticDomainResult(boolean erratic, Integer consistentStatusCode) {
+            this.erratic = erratic; this.consistentStatusCode = consistentStatusCode;
+        }
+        public boolean isErratic() { return erratic; }
+        public Integer getConsistentStatusCode() { return consistentStatusCode; }
+    }
+
+    /**
+     * Phase 2: decide whether the host itself is flaky. After a leading settle
+     * (phaseDelayMs) and a flush burst, send 4x5 attack-free requests. If any
+     * bucketed non-boring code equals the Phase-1 differing code, or two distinct
+     * non-boring codes appear with no attack present, the host is erratic.
+     */
+    public ErraticDomainResult detectErraticDomain(HttpRequest victim, int differingStatusCode) {
+        try {
+            Thread.sleep(phaseDelayMs);
+            // Flush: 3 batches x 3
+            for (int b = 0; b < 3; b++) send(List.of(victim, victim, victim));
+            // Check: 4 batches x 5
+            Integer first = null;
+            for (int b = 0; b < 4; b++) {
+                List<MontoyaRequestResponse> resp = send(List.of(victim, victim, victim, victim, victim));
+                for (MontoyaRequestResponse r : resp) {
+                    if (r == null || r.response() == null) continue;
+                    int raw = normalizeStatusCode(r);
+                    int code = bucketStatusCode(raw);
+                    if (code == differingStatusCode) return new ErraticDomainResult(true, null);
+                    if (isBoringStatusCode(raw)) continue;
+                    if (first == null) { first = code; continue; }
+                    if (code != first) return new ErraticDomainResult(true, null);
+                }
+            }
+            return new ErraticDomainResult(false, first);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new ErraticDomainResult(false, null);
+        }
+    }
+
+    /**
+     * Attack-free control burst (4x5). Returns the observed non-boring bucketed
+     * victim codes. Used by the correlation gate to detect a time-correlated
+     * confound: any off-baseline code seen here is not attack-caused.
+     */
+    public Set<Integer> runControlBurst(HttpRequest victim) {
+        Set<Integer> observed = new HashSet<>();
+        List<MontoyaRequestResponse> ignored = new ArrayList<>();
+        for (int b = 0; b < 4; b++) {
+            List<MontoyaRequestResponse> resp = send(List.of(victim, victim, victim, victim, victim));
+            for (MontoyaRequestResponse r : resp) collectVictimResponse(r, observed, ignored);
+        }
+        return observed;
+    }
+
+    // ---- Phase 3: followup scans ------------------------------------------
+
+    public static class FollowupResult {
+        final boolean foundThirdCode; final Integer newStatusCode;
+        final MontoyaRequestResponse responseWithNewCode; final MontoyaRequestResponse attackResponse;
+        final ProbePayloads.Payload triggeringPayload; final Set<Integer> uniqueAttackStatusCodes;
+        final List<MontoyaRequestResponse> attackResponsesWithDistinctCodes;
+        final List<ReflectionResult> reflections;
+        FollowupResult(boolean f, Integer n, MontoyaRequestResponse rn, MontoyaRequestResponse ar,
+                ProbePayloads.Payload tp, Set<Integer> ua, List<MontoyaRequestResponse> ad,
+                List<ReflectionResult> refl) {
+            foundThirdCode = f; newStatusCode = n; responseWithNewCode = rn; attackResponse = ar;
+            triggeringPayload = tp; uniqueAttackStatusCodes = ua == null ? new HashSet<>() : new HashSet<>(ua);
+            attackResponsesWithDistinctCodes = ad == null ? new ArrayList<>() : new ArrayList<>(ad);
+            reflections = refl == null ? new ArrayList<>() : new ArrayList<>(refl);
+        }
+        public boolean foundThirdCode() { return foundThirdCode; }
+        public Integer getNewStatusCode() { return newStatusCode; }
+        public MontoyaRequestResponse getResponseWithNewCode() { return responseWithNewCode; }
+        public MontoyaRequestResponse getAttackResponse() { return attackResponse; }
+        public ProbePayloads.Payload getTriggeringPayload() { return triggeringPayload; }
+        public Set<Integer> getUniqueAttackStatusCodes() { return new HashSet<>(uniqueAttackStatusCodes); }
+        public List<MontoyaRequestResponse> getAttackResponsesWithDistinctCodes() { return new ArrayList<>(attackResponsesWithDistinctCodes); }
+        public List<ReflectionResult> getReflections() { return new ArrayList<>(reflections); }
+    }
+
+    /**
+     * Phase 3: iterate all payloads, rebuilding a desync'd attack per payload via
+     * {@code attackBuilder}. Returns on the first victim code that is neither an
+     * initial Phase-1 code nor the Phase-2 baseline (the "third code"); otherwise
+     * summarises the unique attack codes seen. Reflections across all payloads are
+     * carried on the result so the caller can report them.
+     */
+    public FollowupResult runFollowupScans(
+            java.util.function.BiFunction<ProbePayloads.Payload, Integer, HttpRequest> attackBuilder,
+            HttpRequest victim, Set<Integer> initialVictimCodes, int techniqueId,
+            Integer consistentBaselineCode) throws InterruptedException {
+        int batch = 2;
+        Set<Integer> uniqueAttack = new HashSet<>();
+        Map<Integer, MontoyaRequestResponse> attackByCode = new HashMap<>();
+        List<ReflectionResult> allReflections = new ArrayList<>();
+        for (ProbePayloads.Payload payload : ProbePayloads.getAllPayloads()) {
+            Thread.sleep(followupDelayMs);
+            HttpRequest attack = attackBuilder.apply(payload, batch);
+            VictimCheckResult result = runVictimCheckWithCanary(attack, victim, payload, techniqueId, batch);
+            batch++;
+            allReflections.addAll(result.getReflections());
+            for (MontoyaRequestResponse ar : result.getAttackResponses()) {
+                if (ar != null && ar.response() != null) {
+                    int raw = normalizeStatusCode(ar);
+                    int code = bucketStatusCode(raw);
+                    if (!isBoringStatusCode(raw) && !uniqueAttack.contains(code)) {
+                        uniqueAttack.add(code); attackByCode.put(code, ar);
+                    }
+                }
+            }
+            for (Integer code : result.getVictimStatusCodes()) {
+                if (!initialVictimCodes.contains(code)
+                        && (consistentBaselineCode == null || !consistentBaselineCode.equals(code))) {
+                    MontoyaRequestResponse ev = null;
+                    for (MontoyaRequestResponse r : result.getVictimResponses()) {
+                        if (r != null && r.response() != null
+                                && bucketStatusCode(normalizeStatusCode(r)) == code) { ev = r; break; }
+                    }
+                    MontoyaRequestResponse ar = result.getAttackResponses().isEmpty() ? null : result.getAttackResponses().get(0);
+                    return new FollowupResult(true, code, ev, ar, payload, uniqueAttack,
+                            new ArrayList<>(attackByCode.values()), allReflections);
+                }
+            }
+        }
+        return new FollowupResult(false, null, null, null, null, uniqueAttack,
+                new ArrayList<>(attackByCode.values()), allReflections);
+    }
+
+    // ---- Phase 4 + correlation gate + orchestration -----------------------
+
+    public static class DetectionResult {
+        public boolean success;
+        public AuditIssueSeverity severity;
+        public String title = "";
+        public String detail = "";
+        public final List<MontoyaRequestResponse> evidence = new ArrayList<>();
+        public final List<ReflectionResult> reflections = new ArrayList<>();
+        static DetectionResult failure() { DetectionResult d = new DetectionResult(); d.success = false; return d; }
+    }
+
+    /**
+     * Full CL.0 victim validation: Phase 1 (inconsistency) -> Phase 2 (erratic
+     * gate) -> Phase 3 (third-code hunt) -> Phase 4 (reproduce) -> correlation
+     * gate. Reflections from Phases 1/3/4 are collected onto the result regardless
+     * of the status-code outcome; the caller reports them independently.
+     */
+    public DetectionResult validate(HttpRequest attack,
+            java.util.function.BiFunction<ProbePayloads.Payload, Integer, HttpRequest> attackBuilder,
+            HttpRequest victim, ProbePayloads.Payload payload, int techniqueId,
+            String hostname, String vectorLabel, Set<String> erraticHosts) {
+
+        // Known-erratic host: skip (no Phase 1 run, so nothing to report).
+        if (erraticHosts.contains(hostname)) {
+            return DetectionResult.failure();
+        }
+
+        DetectionResult result = new DetectionResult();
+
+        // Phase 1: victim check with canary injection (batch 1).
+        VictimCheckResult victimResult = runVictimCheckWithCanary(attack, victim, payload, techniqueId, 1);
+        result.reflections.addAll(victimResult.getReflections());
+        if (!victimResult.foundInconsistency()) {
+            return result; // no desync signal; reflections still delivered
+        }
+
+        int differingStatusCode = victimResult.getVictimStatusCodes().iterator().next();
+
+        // Phase 2: erratic-domain detection (leading settle sleep is inside).
+        ErraticDomainResult erraticResult = detectErraticDomain(victim, differingStatusCode);
+        if (erraticResult.isErratic()) {
+            erraticHosts.add(hostname);
+            return result;
+        }
+
+        // Inter-phase sleep.
+        try {
+            Thread.sleep(phaseDelayMs);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return result;
+        }
+
+        // Phase 3: followup scans across all payloads.
+        FollowupResult followupResult;
+        try {
+            followupResult = runFollowupScans(attackBuilder, victim,
+                    victimResult.getVictimStatusCodes(), techniqueId,
+                    erraticResult.getConsistentStatusCode());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return result;
+        }
+        result.reflections.addAll(followupResult.getReflections());
+
+        // Evidence: one attack response + two distinct victim responses from Phase 1.
+        List<MontoyaRequestResponse> evidence = new ArrayList<>();
+        if (!victimResult.getAttackResponses().isEmpty()) {
+            MontoyaRequestResponse attackResponse = victimResult.getAttackResponses().get(0);
+            if (attackResponse != null) evidence.add(attackResponse);
+        }
+        addTwoDistinctResponses(victimResult.getVictimResponses(), victimResult.getVictimStatusCodes(), evidence);
+
+        String title;
+        String detail;
+        AuditIssueSeverity severity;
+
+        // Raw codes for the report (e.g. "[521, 522]" not the synthetic bucket "[599]").
+        String victimCodesStr = victimResult.getRawVictimStatusCodes().toString();
+        Integer consistentCode = erraticResult.getConsistentStatusCode();
+        String consistentCodeStr = consistentCode != null ? String.valueOf(consistentCode) : "unknown";
+        boolean phase1HadBucketedCode = victimResult.getVictimStatusCodes().contains(BUCKETED_5XX_ORIGIN);
+
+        if (followupResult.foundThirdCode()) {
+            // Confirmed: a third unique victim code was triggered.
+            title = "Victim Desync: Confirmed";
+            String payloadDesc = "";
+            ProbePayloads.Payload triggeringPayload = followupResult.getTriggeringPayload();
+            if (triggeringPayload != null) {
+                payloadDesc = " (payload ID: " + triggeringPayload.getId() + ")";
+            }
+            detail = "When the victim request was sent alongside the attack, it received inconsistent status codes: " + victimCodesStr + "\n\n" +
+                "When the victim request was sent without the attack, it received a consistent status code of " + consistentCodeStr + "\n\n" +
+                "Sending an attack with a different payload" + payloadDesc + " resulted in a third unique victim code of " + followupResult.getNewStatusCode();
+            severity = AuditIssueSeverity.HIGH;
+            if (followupResult.getAttackResponse() != null) evidence.add(followupResult.getAttackResponse());
+            if (followupResult.getResponseWithNewCode() != null) evidence.add(followupResult.getResponseWithNewCode());
+        } else {
+            // Phase 4: verify the Phase 1 inconsistency reproduces (filter server blips).
+            boolean inconsistencyReproduced = false;
+            for (int retry = 1; retry <= phase4Retries; retry++) {
+                try {
+                    Thread.sleep(phaseDelayMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return result;
+                }
+                // Batch 4 (Phase 1 was batch 1, Phase 3 batches 2-3).
+                VictimCheckResult retryResult = runVictimCheckWithCanary(attack, victim, payload, techniqueId, 4);
+                result.reflections.addAll(retryResult.getReflections());
+                if (retryResult.foundInconsistency()) {
+                    inconsistencyReproduced = true;
+                    break;
+                }
+            }
+
+            if (!inconsistencyReproduced) {
+                return result; // likely a server blip; reflections still delivered
+            }
+
+            // Suppress weaker (non-Confirmed) findings when Phase 1 saw a bucketed
+            // 5xx-origin code: too noisy to report without a third-code witness.
+            if (phase1HadBucketedCode) {
+                return result;
+            }
+
+            Set<Integer> uniqueAttackCodes = followupResult.getUniqueAttackStatusCodes();
+            if (uniqueAttackCodes.size() >= 3) {
+                // Attack variation: different payloads produced different attack responses.
+                title = "Victim Desync: Unconfirmed (Attack Variation)";
+                detail = "When the victim request was sent alongside the attack, it received inconsistent status codes: " + victimCodesStr + "\n\n" +
+                    "When the victim request was sent without the attack, it received a consistent status code of " + consistentCodeStr + "\n\n" +
+                    "We were unable to trigger a third unique victim status code. However, different attack payloads received different responses: " + uniqueAttackCodes + ", suggesting the server processes smuggling payloads differently.";
+                severity = AuditIssueSeverity.MEDIUM;
+                int addedAttackEvidence = 0;
+                for (MontoyaRequestResponse attackResp : followupResult.getAttackResponsesWithDistinctCodes()) {
+                    if (attackResp != null && addedAttackEvidence < 3) {
+                        evidence.add(attackResp);
+                        addedAttackEvidence++;
+                    }
+                }
+            } else {
+                // Unconfirmed: no third code, but Phase 1 inconsistency was reproduced.
+                title = "Victim Desync: Unconfirmed";
+                detail = "When the victim request was sent alongside the attack, it received inconsistent status codes: " + victimCodesStr + "\n\n" +
+                    "When the victim request was sent without the attack, it received a consistent status code of " + consistentCodeStr + "\n\n" +
+                    "We were unable to trigger a third unique victim status code by sending an attack with a different payload.";
+                severity = AuditIssueSeverity.LOW;
+            }
+        }
+
+        // Correlation gate (pre-report): distinguish a real desync from a
+        // time-correlated confound (rebooting/flaky backend). Needs a Phase-2
+        // baseline; if unknown we cannot score, so skip. Only runs if enabled.
+        Integer baselineCode = erraticResult.getConsistentStatusCode();
+        if (correlationEnabled && baselineCode != null) {
+            final ProbePayloads.Payload correlationPayload =
+                (followupResult.foundThirdCode() && followupResult.getTriggeringPayload() != null)
+                    ? followupResult.getTriggeringPayload()
+                    : payload;
+            CorrelationCheck.Result correlation;
+            try {
+                correlation = CorrelationCheck.defaults(correlationGapMs).run(
+                    baselineCode,
+                    cycle -> runVictimCheckWithCanary(
+                        attackBuilder.apply(correlationPayload, 100 + cycle),
+                        victim, correlationPayload, techniqueId, 100 + cycle).getVictimStatusCodes(),
+                    cycle -> runControlBurst(victim));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return result;
+            }
+
+            switch (correlation.verdict()) {
+                case DISCARD -> {
+                    // Off-baseline code appeared in an attack-free control run.
+                    return result;
+                }
+                case UNREPLICABLE -> {
+                    severity = AuditIssueSeverity.LOW;
+                    title = title + " (Unreplicable)";
+                    detail = detail + "\n\nEnhanced validation: could not reproduce the anomaly under attack (" +
+                        correlation.attackDirtyCycles() + "/" + correlation.cyclesRun() +
+                        " cycles) and it never appeared in an attack-free control run. Demoted to LOW.";
+                }
+                case VERIFIED -> {
+                    detail = detail + "\n\n✓ Attack-correlated (enhanced validation): the anomaly reproduced under " +
+                        "attack in " + correlation.attackDirtyCycles() + "/" + correlation.cyclesRun() +
+                        " cycles and never appeared in " + correlation.cyclesRun() + " attack-free control runs.";
+                }
+            }
+        }
+
+        result.success = true;
+        result.severity = severity;
+        result.title = title + " — " + vectorLabel;
+        result.detail = detail;
+        result.evidence.addAll(evidence);
+        return result;
+    }
+
+    /**
+     * Adds up to two victim responses with distinct bucketed status codes to the
+     * evidence list. Buckets both sides so 5xx-origin codes (stored as
+     * {@link #BUCKETED_5XX_ORIGIN}) still match.
+     */
+    private void addTwoDistinctResponses(List<MontoyaRequestResponse> victimResponses,
+                                         Set<Integer> victimStatusCodes,
+                                         List<MontoyaRequestResponse> evidence) {
+        Set<Integer> addedCodes = new HashSet<>();
+        for (MontoyaRequestResponse response : victimResponses) {
+            if (response == null || response.response() == null) continue;
+            int statusCode = bucketStatusCode(normalizeStatusCode(response));
+            if (victimStatusCodes.contains(statusCode) && !addedCodes.contains(statusCode)) {
+                evidence.add(response);
+                addedCodes.add(statusCode);
+                if (addedCodes.size() >= 2) return;
+            }
         }
     }
 }
