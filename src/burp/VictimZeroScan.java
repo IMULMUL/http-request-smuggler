@@ -83,8 +83,11 @@ public class VictimZeroScan extends SmuggleScanBox {
 
         ProbePayloads.Payload payload = ProbePayloads.getDefaultPayload();
 
-        // Victim = clean cache-busted baseline (no smuggle, no desync).
-        byte[] victimBytes = Utilities.addCacheBuster(baseReq, null);
+        // Victim = clean cache-busted baseline (no smuggle, no desync), built from reqBase so it
+        // rides the SAME transport as the attack. reqBase already carries the HTTP/2 -> HTTP/1.1
+        // request-line downgrade and the Connection handling; building from raw baseReq would leave
+        // an HTTP/2 request line on an HTTP/1 send for HTTP/1 vectors (a broken victim).
+        byte[] victimBytes = Utilities.addCacheBuster(reqBase, null);
         HttpRequest victim = Utilities.buildMontoyaReq(victimBytes, service);
         if (forceHTTP2) victim = victim.withAddedHeader("X-Http2", "1");
 
