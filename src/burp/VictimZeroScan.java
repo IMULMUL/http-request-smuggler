@@ -1,0 +1,133 @@
+package burp;
+
+import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.function.BiFunction;
+
+/**
+ * CL.0 victim scan: same vectors as ImplicitZeroScan, but detects desync via
+ * victim-request inconsistency + canary reflection (ported from validator2's VictimScan).
+ */
+public class VictimZeroScan extends SmuggleScanBox {
+
+    private final Set<String> erraticHosts = new HashSet<>();
+    private final List<String> permutationIndex = new ArrayList<>(); // stable technique-id map
+
+    VictimZeroScan(String name) {
+        super(name);
+        // Same vector set as ImplicitZeroScan.
+        scanSettings.importSettings(DesyncBox.sharedSettings);
+        scanSettings.importSettings(DesyncBox.sharedPermutations);
+        scanSettings.importSettings(DesyncBox.clPermutations);
+        scanSettings.importSettings(DesyncBox.h2Permutations);
+        scanSettings.importSettings(DesyncBox.h1Permutations);
+        // Victim-scan settings (5s sleeps per the design).
+        scanSettings.register("victim: phase delay ms", 5000);
+        scanSettings.register("victim: followup delay ms", 5000);
+        scanSettings.register("victim: phase4 retries", 5);
+        scanSettings.register("victim: enable correlation check", true);
+        scanSettings.register("victim: correlation gap ms", 5000);
+    }
+
+    /** Stable int id for a permutation name (index in first-seen order). */
+    private int techniqueIdFor(String technique) {
+        int idx = permutationIndex.indexOf(technique);
+        if (idx < 0) { permutationIndex.add(technique); idx = permutationIndex.size() - 1; }
+        return idx;
+    }
+
+    @Override
+    public boolean doConfiguredScan(byte[] baseReq, IHttpService service, HashMap<String, Boolean> config) {
+        Utilities.supportsHTTP2 = true;
+        boolean h2 = Utilities.isHTTP2(baseReq);
+        baseReq = Utilities.addCacheBuster(baseReq, null);
+        byte[] req = SmuggleScanBox.setupRequest(baseReq);
+
+        String technique = config.keySet().iterator().next();
+        if (null == DesyncBox.applyDesync(req, "Content-Length", technique)) return false;
+
+        boolean forceHTTP1 = false, forceHTTP2 = false;
+        if (DesyncBox.h1Permutations.contains(technique)) {
+            forceHTTP1 = true;
+        } else if (DesyncBox.h2Permutations.contains(technique)) {
+            if (!h2) {
+                Resp h2test = HTTP2Scan.h2request(service, baseReq);
+                if (h2test.failed() || !Utilities.containsBytes(h2test.getReq().getResponse(), "HTTP/2".getBytes())) return false;
+                h2 = true;
+            }
+            forceHTTP2 = true;
+        }
+
+        req = Utilities.replaceFirst(req, " HTTP/2\r\n", " HTTP/1.1\r\n");
+        if (h2 && !forceHTTP1) req = Utilities.replaceFirst(req, "Connection: ", "X-Connection: ");
+        else req = Utilities.addOrReplaceHeader(req, "Connection", "keep-alive");
+
+        final int techniqueId = techniqueIdFor(technique);
+        final byte[] reqBase = req;                 // effectively-final for the lambda
+        final boolean fHttp2 = forceHTTP2;
+
+        // Build a fully-formed desync'd attack for a (payload, batch): inject canary at position 0.
+        BiFunction<ProbePayloads.Payload, Integer, HttpRequest> attackBuilder = (payload, batch) -> {
+            String body = CanaryUtils.injectCanaryIntoPayload(payload.getBody(), techniqueId, batch, 0);
+            byte[] attack = Utilities.fixContentLength(Utilities.setBody(reqBase, body));
+            attack = DesyncBox.applyDesync(attack, "Content-Length", technique);
+            HttpRequest hr = Utilities.buildMontoyaReq(attack, service);
+            return fHttp2 ? hr.withAddedHeader("X-Http2", "1") : hr;
+        };
+
+        ProbePayloads.Payload payload = ProbePayloads.getDefaultPayload();
+        HttpRequest attack = attackBuilder.apply(payload, 1);
+
+        // Victim = clean cache-busted baseline (no smuggle, no desync).
+        byte[] victimBytes = Utilities.addCacheBuster(baseReq, null);
+        HttpRequest victim = Utilities.buildMontoyaReq(victimBytes, service);
+        if (forceHTTP2) victim = victim.withAddedHeader("X-Http2", "1");
+
+        VictimDetector detector = new VictimDetector(
+            Utilities.globalSettings.getInt("victim: phase delay ms"),
+            Utilities.globalSettings.getInt("victim: followup delay ms"),
+            Utilities.globalSettings.getInt("victim: phase4 retries"),
+            Utilities.globalSettings.getBoolean("victim: enable correlation check"),
+            Utilities.globalSettings.getInt("victim: correlation gap ms"));
+
+        VictimDetector.DetectionResult result;
+        try {
+            result = detector.validate(
+                attack, attackBuilder, victim, payload, techniqueId,
+                service.getHost(), technique, erraticHosts);
+        } catch (Exception e) {
+            Utilities.out("VictimZeroScan: unexpected error validating " + service.getHost() + " (" + technique + "): " + e);
+            return false;
+        }
+
+        // Reflections are reported independently of the status-code finding.
+        for (ReflectionResult refl : result.reflections) reportReflection(refl);
+
+        if (!result.success) return false;
+        fileIssue(result.title, result.detail, result.severity, result.evidence);
+        return true;
+    }
+
+    private void reportReflection(ReflectionResult refl) {
+        List<MontoyaRequestResponse> ev = new ArrayList<>();
+        if (refl.getOriginalRequest() != null) ev.add(refl.getOriginalRequest());
+        if (refl.getReflectingResponse() != null) ev.add(refl.getReflectingResponse());
+        fileIssue(refl.getTitle(), refl.getDetail(), refl.getSeverity(), ev);
+    }
+
+    private void fileIssue(String title, String detail, AuditIssueSeverity severity, List<MontoyaRequestResponse> evidence) {
+        // MontoyaRequestResponse implements HttpRequestResponse directly.
+        burp.api.montoya.http.message.HttpRequestResponse[] arr =
+            evidence.toArray(new burp.api.montoya.http.message.HttpRequestResponse[0]);
+        Report report = new Report(title, detail,
+            "Detected via victim-request inconsistency / canary reflection. See https://portswigger.net/research/browser-powered-desync-attacks",
+            "", severity, arr);
+        Utilities.montoyaApi.siteMap().add(report.getIssue());
+    }
+}
