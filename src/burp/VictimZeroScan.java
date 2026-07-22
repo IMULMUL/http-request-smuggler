@@ -5,7 +5,6 @@ import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.function.BiFunction;
@@ -16,8 +15,9 @@ import java.util.function.BiFunction;
  */
 public class VictimZeroScan extends SmuggleScanBox {
 
-    private final Set<String> erraticHosts = new HashSet<>();
-    private final List<String> permutationIndex = new ArrayList<>(); // stable technique-id map
+    private final Set<String> erraticHosts = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.ConcurrentHashMap<String, Integer> techniqueIds = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicInteger nextTechniqueId = new java.util.concurrent.atomic.AtomicInteger(0);
 
     VictimZeroScan(String name) {
         super(name);
@@ -37,9 +37,7 @@ public class VictimZeroScan extends SmuggleScanBox {
 
     /** Stable int id for a permutation name (index in first-seen order). */
     private int techniqueIdFor(String technique) {
-        int idx = permutationIndex.indexOf(technique);
-        if (idx < 0) { permutationIndex.add(technique); idx = permutationIndex.size() - 1; }
-        return idx;
+        return techniqueIds.computeIfAbsent(technique, k -> nextTechniqueId.getAndIncrement());
     }
 
     @Override
