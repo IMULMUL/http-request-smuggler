@@ -36,7 +36,7 @@ public class BurpExtender implements IBurpExtender, IExtensionStateListener, Bur
         new HeaderRemovalScan("Header removal");
 
         new ImplicitZeroScan("CL.0");
-        new VictimZeroScan("CL.0 victim");
+        new VictimZeroScan("CL.0 heavyweight");
         new ClientDesyncScan("Client-side desync");
         new PauseDesyncScan("Pause-based desync");
         new ConnectionStateScan("Connection-state");

@@ -28,12 +28,12 @@ public class VictimZeroScan extends SmuggleScanBox {
         scanSettings.importSettings(DesyncBox.clPermutations);
         scanSettings.importSettings(DesyncBox.h2Permutations);
         scanSettings.importSettings(DesyncBox.h1Permutations);
-        // Victim-scan settings (5s sleeps per the design).
-        scanSettings.register("victim: phase delay ms", 5000);
-        scanSettings.register("victim: followup delay ms", 5000);
-        scanSettings.register("victim: phase4 retries", 5);
-        scanSettings.register("victim: enable correlation check", true);
-        scanSettings.register("victim: correlation gap ms", 5000);
+        // Heavyweight-scan settings (5s sleeps per the design).
+        scanSettings.register("heavyweight: phase delay ms", 5000);
+        scanSettings.register("heavyweight: followup delay ms", 5000);
+        scanSettings.register("heavyweight: phase4 retries", 5);
+        scanSettings.register("heavyweight: enable correlation check", true);
+        scanSettings.register("heavyweight: correlation gap ms", 5000);
     }
 
     /** Stable int id for a permutation name (index in first-seen order). */
@@ -92,11 +92,11 @@ public class VictimZeroScan extends SmuggleScanBox {
         if (forceHTTP2) victim = victim.withAddedHeader("X-Http2", "1");
 
         VictimDetector detector = new VictimDetector(
-            Utilities.globalSettings.getInt("victim: phase delay ms"),
-            Utilities.globalSettings.getInt("victim: followup delay ms"),
-            Utilities.globalSettings.getInt("victim: phase4 retries"),
-            Utilities.globalSettings.getBoolean("victim: enable correlation check"),
-            Utilities.globalSettings.getInt("victim: correlation gap ms"));
+            Utilities.globalSettings.getInt("heavyweight: phase delay ms"),
+            Utilities.globalSettings.getInt("heavyweight: followup delay ms"),
+            Utilities.globalSettings.getInt("heavyweight: phase4 retries"),
+            Utilities.globalSettings.getBoolean("heavyweight: enable correlation check"),
+            Utilities.globalSettings.getInt("heavyweight: correlation gap ms"));
 
         VictimDetector.DetectionResult result;
         try {
@@ -136,6 +136,7 @@ public class VictimZeroScan extends SmuggleScanBox {
             + "victim-request status inconsistency and/or canary reflection.";
         String remediation = "Ensure the front-end and back-end agree on request boundaries (consistent "
             + "Content-Length / Transfer-Encoding handling). See "
+            + "https://portswigger.net/research/http-terminator, "
             + "https://portswigger.net/research/browser-powered-desync-attacks and "
             + "https://portswigger.net/web-security/request-smuggling.";
         Report report = new Report(title, detail, background, remediation, severity, arr);
