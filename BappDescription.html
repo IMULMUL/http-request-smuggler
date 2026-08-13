@@ -1,11 +1,15 @@
-<p>This extension automatically detects and exploits <a href="https://portswigger.net/web-security/request-smuggling">HTTP
-    Request Smuggling</a> vulnerabilities using advanced desynchronization techniques developed by PortSwigger
+<p>This extension automatically detects and exploits <a
+        href="https://portswigger.net/web-security/request-smuggling">HTTP
+        Request Smuggling</a> vulnerabilities using advanced desynchronization techniques developed by PortSwigger
     researcher James Kettle. It supports comprehensive scanning for HTTP/1.1 and HTTP/2-downgrade desync
     vulnerabilities, client-side desyncs, and connection state attacks.</p>
 
 <p>Version 3.0 landed in 2025 and adds parser discrepancy detection, which bypasses widespread desync defences and makes
     it significantly more effective. For further information on this, refer to the whitepaper <a
-            href="https://portswigger.net/research/http1-must-die">HTTP/1.1 Must Die: The Desync Endgame</a>.</p>
+        href="https://portswigger.net/research/http1-must-die">HTTP/1.1 Must Die: The Desync Endgame</a>.</p>
+
+<p>New payloads and detection mechanisms are provided, based on the <a
+        href="https://portswigger.net/research/http-terminator">HTTP Terminator</a> research.</p>
 
 <p>It's fully compatible with Burp Suite DAST, Professional, and Community editions. Pro and Community editions have a
     "research mode" for exploring novel techniques, and the DAST integration is useful if you want recurring scans to
@@ -35,6 +39,6 @@
 
 <h2>Practice</h2>
 <p>We've also released <a href="https://portswigger.net/web-security/request-smuggling">free online labs to practise
-    against</a>.</p>
+        against</a>.</p>
 
-<p><br>Copyright &copy; 2018-2025 PortSwigger Ltd.</p>
+<p><br>Copyright &copy; 2018-2026 PortSwigger Ltd.</p>
